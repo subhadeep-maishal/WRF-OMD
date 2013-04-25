@@ -21,3 +21,5 @@ tools/fseeko64_test
 tools/fseeko_test
 tools/gen_comms.c
 tools/registry
+*.backup
+compile.log
