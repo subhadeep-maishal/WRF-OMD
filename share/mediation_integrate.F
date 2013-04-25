@@ -1497,7 +1497,6 @@ SUBROUTINE med_hist_out ( grid , stream, config_flags )
    CHARACTER (LEN=256)                    :: message
    INTEGER                                :: ierr
    LOGICAL                                :: notify_e
-   CHARACTER (LEN=1024)                   :: notify_cmd
 
    IF ( wrf_dm_on_monitor() ) THEN
      CALL start_timing
@@ -1536,19 +1535,27 @@ SUBROUTINE med_hist_out ( grid , stream, config_flags )
 #include "med_hist_out_closes.inc"
 
    END SELECT
+   
    IF ( wrf_dm_on_monitor() ) THEN
      WRITE ( message , FMT = '("Writing ",A30," for domain ",I8)' )TRIM(fname),grid%id     
      CALL end_timing ( TRIM(message) )
      
-     INQUIRE(FILE="./notify.sh", EXIST=notify_e)
+     ! only on master process
+     INQUIRE(FILE="./notify", EXIST=notify_e)
      IF ( notify_e ) THEN
-       notify_cmd = "./notify.sh "//TRIM(fname)//" &"
-       WRITE ( message , *)'Running ./notify.sh script'
-       CALL WRF_message( message )
-       CALL system (notify_cmd)
+      CALL WRF_message ( "Running ./notify "//fname )
+      CALL system ( "./notify "//fname//" &" )
      END IF
      
    END IF
+   
+   ! on every processes
+   INQUIRE(FILE="./notify_all", EXIST=notify_e)
+   IF ( notify_e ) THEN
+     CALL WRF_message ( "Running ./notify_all "//fname )
+     CALL system ( "./notify_all "//fname//" &" )
+   END IF
+   
 
    RETURN
 END SUBROUTINE med_hist_out
