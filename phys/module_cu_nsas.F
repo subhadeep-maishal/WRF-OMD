@@ -2406,7 +2406,7 @@ CONTAINS
 !
       do k = kts, km1
         do i=its,ite
-          xlamue(i,k) = clam / zi(i,k)
+          xlamue(i,k) = clam / zi(i,k+1)
         enddo
       enddo
       do i=its,ite
@@ -3238,7 +3238,7 @@ CONTAINS
             if (k.ge.kbcon(i).and.k.le.ktcon(i)) then
               tem  = dellal(i,k) * xmb(i) * dt2
               tem1 = max(0.0, min(1.0, (tcr-t1(i,k))*tcrf))
-              if (ncloud.ge.4) then
+              if (ncloud.ge.2) then
                 qi2(i,k) = qi2(i,k) + tem * tem1            ! ice
                 qc2(i,k) = qc2(i,k) + tem *(1.0-tem1)       ! water
               else
