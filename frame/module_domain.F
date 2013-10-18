@@ -682,6 +682,7 @@ CONTAINS
 
       ALLOCATE ( new_grid )
       ALLOCATE( new_grid%head_statevars )
+      new_grid%head_statevars%Ndim = 0
       NULLIFY( new_grid%head_statevars%next)
       new_grid%tail_statevars => new_grid%head_statevars 
 
@@ -707,6 +708,8 @@ CONTAINS
       new_grid%time_set = .FALSE.
       new_grid%is_intermediate = .FALSE.
       new_grid%have_displayed_alloc_stats = .FALSE.
+
+      new_grid%tiling_latch = .FALSE.  ! 20121003
 
       ! set up the pointers that represent the nest hierarchy
       ! set this up *prior* to calling the patching or allocation
@@ -945,6 +948,12 @@ CONTAINS
       CALL wrf_dm_define_comms( grid )
 #endif
 
+#if ( NMM_CORE==1 )
+      grid%interp_mp = .not. ( size(grid%f_ice)>1 .or. size(grid%f_rain)>1 .or. size(grid%f_rimef)>1 )
+#else
+      grid%interp_mp = .true.
+#endif
+
    END SUBROUTINE alloc_and_configure_domain
 
    SUBROUTINE get_fieldstr(ix,c,instr,outstr,noutstr,noerr)
@@ -1085,7 +1094,7 @@ CONTAINS
                     CALL get_fieldstr(fieldno,',',fieldlst,t1,256,noerr)
                     CALL change_to_lower_case(t1,lookee)
                     DO WHILE ( noerr )    ! linear search, blargh...
-                      p => grid%head_statevars
+                      p => grid%head_statevars%next
                       found = .FALSE.
                       count_em = count_em + 1
                       DO WHILE ( ASSOCIATED( p ) )
@@ -1162,7 +1171,7 @@ CONTAINS
 
 #ifdef DM_PARALLEL
 ! broadcast the new masks to the other tasks
-      p => grid%head_statevars
+      p => grid%head_statevars%next
       DO WHILE ( ASSOCIATED( p ) )
         IF ( p%Ndim .EQ. 4 .AND. p%scalar_array ) THEN
 
@@ -1672,7 +1681,6 @@ CONTAINS
       INTEGER kid
       IF ( .NOT. ASSOCIATED( grid ) ) RETURN
       myid = grid%id
-      write(0,*)'show_nest_subtree ',myid
       DO kid = 1, max_nests
         IF ( ASSOCIATED( grid%nests(kid)%ptr ) ) THEN
           IF ( grid%nests(kid)%ptr%id .EQ. myid ) THEN
@@ -3037,9 +3045,7 @@ END SUBROUTINE get_current_grid_name
      IMPLICIT NONE
      INTEGER, INTENT(IN) :: id
      TYPE(domain), POINTER :: grid
-!write(0,*)'modify_io_masks head_grid ',id,ASSOCIATED(head_grid)
      CALL find_grid_by_id( id, head_grid, grid )
-!write(0,*)'modify_io_masks grid ',id,ASSOCIATED(grid)
      IF ( ASSOCIATED( grid ) ) CALL modify_io_masks1( grid, id ) 
      RETURN 
    END SUBROUTINE modify_io_masks

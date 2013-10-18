@@ -27,7 +27,7 @@
 !.. Remaining values should probably be left alone.
 !..
 !..Author: Greg Thompson, NCAR-RAL, gthompsn@ucar.edu, 303-497-2805
-!..Last modified: 27 Jul 2012
+!..Last modified: 06 Sep 2013
 !+---+-----------------------------------------------------------------+
 !wrft:model_layer:physics
 !+---+-----------------------------------------------------------------+
@@ -725,7 +725,7 @@
 
       END SUBROUTINE thompson_init
 !+---+-----------------------------------------------------------------+
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..This is a wrapper routine designed to transfer values from 3D to 1D.
 !+---+-----------------------------------------------------------------+
@@ -738,6 +738,8 @@
                               rainprod, evapprod, &
 #endif
                               refl_10cm, diagflag, do_radar_ref,      &
+                              re_cloud, re_ice, re_snow,              &
+                              has_reqc, has_reqi, has_reqs,           &
                               ids,ide, jds,jde, kds,kde, &             ! domain dims
                               ims,ime, jms,jme, kms,kme, &             ! memory dims
                               its,ite, jts,jte, kts,kte)               ! tile dims
@@ -750,6 +752,9 @@
                             its,ite, jts,jte, kts,kte
       REAL, DIMENSION(ims:ime, kms:kme, jms:jme), INTENT(INOUT):: &
                           qv, qc, qr, qi, qs, qg, ni, nr, th
+      REAL, DIMENSION(ims:ime, kms:kme, jms:jme), INTENT(INOUT):: &
+                          re_cloud, re_ice, re_snow
+      INTEGER, INTENT(IN):: has_reqc, has_reqi, has_reqs
 #ifdef WRF_CHEM
       REAL, DIMENSION(ims:ime, kms:kme, jms:jme), INTENT(INOUT):: &
                           rainprod, evapprod
@@ -768,7 +773,8 @@
 !..Local variables
       REAL, DIMENSION(kts:kte):: &
                           qv1d, qc1d, qi1d, qr1d, qs1d, qg1d, ni1d, &
-                          nr1d, t1d, p1d, dz1d, dBZ
+                          nr1d, nc1d, t1d, p1d, dz1d, dBZ
+      REAL, DIMENSION(kts:kte):: re_qc1d, re_qi1d, re_qs1d
 #ifdef WRF_CHEM
       REAL, DIMENSION(kts:kte):: &
                           rainprod1d, evapprod1d
@@ -889,6 +895,9 @@
          SR(i,j) = (pptsnow + pptgraul + pptice)/(RAINNCV(i,j)+1.e-12)
 
          do k = kts, kte
+            nc1d(k) = Nt_c
+         enddo
+         do k = kts, kte
             qv(i,k,j) = qv1d(k)
             qc(i,k,j) = qc1d(k)
             qi(i,k,j) = qi1d(k)
@@ -973,14 +982,16 @@
              CALL wrf_debug(150, mp_debug)
             endif
             if (qv1d(k) .lt. 0.0) then
-             if (k.lt.kte-2 .and. k.gt.kts+1) then
-                qv(i,k,j) = 0.5*(qv(i,k-1,j) + qv(i,k+1,j))
-             else
-                qv(i,k,j) = 1.E-7
-             endif
              write(mp_debug,*) 'WARNING, negative qv ', qv1d(k),        &
                         ' at i,j,k=', i,j,k
              CALL wrf_debug(150, mp_debug)
+             if (k.lt.kte-2 .and. k.gt.kts+1) then
+                write(mp_debug,*) '   below and above are: ', qv(i,k-1,j), qv(i,k+1,j)
+                CALL wrf_debug(150, mp_debug)
+                qv(i,k,j) = MAX(1.E-7, 0.5*(qv(i,k-1,j) + qv(i,k+1,j)))
+             else
+                qv(i,k,j) = 1.E-7
+             endif
             endif
          enddo
 
@@ -993,6 +1004,22 @@
           enddo
          endif
          ENDIF
+
+         IF ( (has_reqc.ne.0) .and. (has_reqi.ne.0) .and. (has_reqs.ne.0) ) THEN
+          do k = kts, kte
+             re_qc1d(k) = 2.51E-6
+             re_qi1d(k) = 5.01E-6
+             re_qs1d(k) = 25.01E-6
+          enddo
+          call calc_effectRad (t1d, p1d, qv1d, qc1d, nc1d, qi1d, ni1d, qs1d,  &
+                      re_qc1d, re_qi1d, re_qs1d, kts, kte)
+          do k = kts, kte
+             re_cloud(i,k,j) = MAX(2.51E-6, MIN(re_qc1d(k), 50.E-6))
+             re_ice(i,k,j)   = MAX(5.01E-6, MIN(re_qi1d(k), 125.E-6))
+             re_snow(i,k,j)  = MAX(25.E-6, MIN(re_qs1d(k), 999.E-6))
+          enddo
+         ENDIF
+
 
       enddo i_loop
       enddo j_loop
@@ -1016,7 +1043,7 @@
       END SUBROUTINE mp_gt_driver
 
 !+---+-----------------------------------------------------------------+
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !+---+-----------------------------------------------------------------+
 !.. This subroutine computes the moisture tendencies of water vapor,
@@ -1114,7 +1141,7 @@
       REAL:: r_frac, g_frac
       REAL:: Ef_rw, Ef_sw, Ef_gw, Ef_rr
       REAL:: dtsave, odts, odt, odzq
-      REAL:: xslw1, ygra1, zans1
+      REAL:: xslw1, ygra1, zans1, eva_factor
       INTEGER:: i, k, k2, n, nn, nstep, k_0, kbot, IT, iexfrq
       INTEGER, DIMENSION(4):: ksed1
       INTEGER:: nir, nis, nig, nii, nic
@@ -1486,12 +1513,14 @@
 
 !..Rain self-collection follows Seifert, 1994 and drop break-up
 !.. follows Verlinde and Cotton, 1993.                                        RAIN2M
+!.. Reduced leading coeff because higher values overly force to singular
+!.. mean size of rain.
          if (L_qr(k) .and. mvd_r(k).gt. D0r) then
 !-GT      Ef_rr = 1.0
 !-GT      if (mvd_r(k) .gt. 1500.0E-6) then
              Ef_rr = 2.0 - EXP(2300.0*(mvd_r(k)-1600.0E-6))
 !-GT      endif
-          pnr_rcr(k) = Ef_rr * 4.*nr(k)*rr(k)
+          pnr_rcr(k) = Ef_rr * 0.5*nr(k)*rr(k)
          endif
 
          mvd_c(k) = D0c
@@ -1794,6 +1823,10 @@
            pni_wfz(k) = tni_qcfz(idx_c,idx_tc)*odts
            pni_wfz(k) = MIN(DBLE(Nt_c*odts), pri_wfz(k)/(2.*xm0i), &
                                 pni_wfz(k))
+          elseif (rc(k).gt. R1 .and. temp(k).lt.HGFR) then
+           pri_wfz(k) = rc(k)*odts
+           pni_wfz(k) = MIN(DBLE(Nt_c*odts), pri_wfz(k)/(2.*xm0i), &
+                                pni_wfz(k))
           endif
 
 !..Nucleate ice from deposition & condensation freezing (Cooper 1986)
@@ -1955,7 +1988,7 @@
 !-GT                               * (prr_rcg(k)+prg_gcw(k))
            prr_gml(k) = MIN(DBLE(rg(k)*odts), MAX(0.D0, prr_gml(k)))
            pnr_gml(k) = N0_g(k)*cgg(2)*ilamg(k)**cge(2) / rg(k)         &   ! RAIN2M
-                      * prr_gml(k) * 10.0**(-1.5*tempc)
+                      * prr_gml(k) * 10.0**(-.25*tempc)
            if (tempc.gt.7.5 .or. rg(k).lt.0.005E-3) pnr_gml(k)=0.0
 
            if (ssati(k).lt. 0.) then
@@ -2459,6 +2492,14 @@
               + t2_qr_ev*vsc2(k)*rhof2(k)*((lamr+0.5*fv_r)**(-cre(11))))
           rate_max = MIN((rr(k)/rho(k)*odts), (qvs(k)-qv(k))*odts)
           prv_rev(k) = MIN(DBLE(rate_max), prv_rev(k)/rho(k))
+!..REDUCE the rain evaporation in same places as melting graupel occurs. 
+!..Rationale: not much shedding of the water from the graupel so
+!..likely that the water-coated graupel evaporating much slower than
+!..if the water was immediately shed off.
+          IF (prr_gml(k).gt.0.0) THEN
+             eva_factor = MIN(1.0, 0.01+(0.99-0.01)*(tempc/20.0))
+             prv_rev(k) = prv_rev(k)*eva_factor
+          ENDIF
           endif
           pnr_rev(k) = MIN(DBLE(nr(k)*0.99/rho(k)*odts),                &   ! RAIN2M
                        prv_rev(k) * nr(k)/rr(k))
@@ -2825,7 +2866,7 @@
 
       end subroutine mp_thompson
 !+---+-----------------------------------------------------------------+
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..Creation of the lookup tables and support functions found below here.
 !+---+-----------------------------------------------------------------+
@@ -2940,7 +2981,7 @@
 
       end subroutine qr_acr_qg
 !+---+-----------------------------------------------------------------+
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..Rain collecting snow (and inverse).  Explicit CE integration.
 !+---+-----------------------------------------------------------------+
@@ -3132,7 +3173,7 @@
 
       end subroutine qr_acr_qs
 !+---+-----------------------------------------------------------------+
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..This is a literal adaptation of Bigg (1954) probability of drops of
 !..a particular volume freezing.  Given this probability, simply freeze
@@ -3175,7 +3216,7 @@
                sum2 = 0.0d0
                sumn1 = 0.0d0
                sumn2 = 0.0d0
-               do n2 = 1, nbr
+               do n2 = nbr, 1, -1
                   N_r(n2) = N0_r*Dr(n2)**mu_r*DEXP(-lamr*Dr(n2))*dtr(n2)
                   vol = massr(n2)*orho_w
                   prob = 1.0D0 - DEXP(-120.0D0*vol*5.2D-4 * Texp)
@@ -3186,6 +3227,7 @@
                      sumn2 = sumn2 + prob*N_r(n2)
                      sum2 = sum2 + prob*N_r(n2)*massr(n2)
                   endif
+                  if ((sum1+sum2) .ge. r_r(i)) EXIT
                enddo
                tpi_qrfz(i,j,k) = sum1
                tni_qrfz(i,j,k) = sumn1
@@ -3198,7 +3240,7 @@
             N0_c = 1.0D-18 * Nt_c*ocg1 * lamc**cce(1)
             sum1 = 0.0d0
             sumn2 = 0.0d0
-            do n = 1, nbc
+            do n = nbc, 1, -1
                y = Dc(n)*1.0D6
                vol = massc(n)*orho_w
                prob = 1.0D0 - DEXP(-120.0D0*vol*5.2D-4 * Texp)
@@ -3206,6 +3248,7 @@
                N_c(n) = 1.0D24 * N_c(n)
                sumn2 = sumn2 + prob*N_c(n)
                sum1 = sum1 + prob*N_c(n)*massc(n)
+               if (sum1 .ge. r_c(i)) EXIT
             enddo
             tpi_qcfz(i,k) = sum1
             tni_qcfz(i,k) = sumn2
@@ -3214,7 +3257,7 @@
 
       end subroutine freezeH2O
 !+---+-----------------------------------------------------------------+
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..Cloud ice converting to snow since portion greater than min snow
 !.. size.  Given cloud ice content (kg/m**3), number concentration
@@ -3270,7 +3313,7 @@
       enddo
 
       end subroutine qi_aut_qs
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..Variable collision efficiency for rain collecting cloud water using
 !.. method of Beard and Grover, 1974 if a/A less than 0.25; otherwise
@@ -3334,7 +3377,7 @@
       enddo
 
       end subroutine table_Efrw
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..Variable collision efficiency for snow collecting cloud water using
 !.. method of Wang and Ji, 2000 except equate melted snow diameter to
@@ -3378,7 +3421,7 @@
       enddo
 
       end subroutine table_Efsw
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !..Integrate rain size distribution from zero to D-star to compute the
 !.. number of drops smaller than D-star that evaporate in a single
@@ -3446,7 +3489,7 @@
 !         pnr_rev(k) = MIN(nr(k)*odts, SNGL(tnr_rev(idx_d,idx_r1,idx_r) &   ! RAIN2M
 !                    * odts))
 !
-!ctrlL
+!
 !+---+-----------------------------------------------------------------+
 !+---+-----------------------------------------------------------------+
       SUBROUTINE GCF(GAMMCF,A,X,GLN)
@@ -3636,6 +3679,111 @@
 
       END FUNCTION RSIF
 !+---+-----------------------------------------------------------------+
+
+!+---+-----------------------------------------------------------------+
+!..Compute _radiation_ effective radii of cloud water, ice, and snow.
+!.. These are entirely consistent with microphysics assumptions, not
+!.. constant or otherwise ad hoc as is internal to most radiation
+!.. schemes.  Since only the smallest snowflakes should impact
+!.. radiation, compute from first portion of complicated Field number
+!.. distribution, not the second part, which is the larger sizes.
+!+---+-----------------------------------------------------------------+
+
+      subroutine calc_effectRad (t1d, p1d, qv1d, qc1d, nc1d, qi1d, ni1d, qs1d,   &
+     &                re_qc1d, re_qi1d, re_qs1d, kts, kte)
+
+      IMPLICIT NONE
+
+!..Sub arguments
+      INTEGER, INTENT(IN):: kts, kte
+      REAL, DIMENSION(kts:kte), INTENT(IN):: &
+     &                    t1d, p1d, qv1d, qc1d, nc1d, qi1d, ni1d, qs1d
+      REAL, DIMENSION(kts:kte), INTENT(INOUT):: re_qc1d, re_qi1d, re_qs1d
+!..Local variables
+      INTEGER:: k
+      REAL, DIMENSION(kts:kte):: rho, rc, nc, ri, ni, rs
+      REAL:: smo2, smob, smoc
+      REAL:: tc0, loga_, a_, b_
+      DOUBLE PRECISION:: lamc, lami
+      LOGICAL:: has_qc, has_qi, has_qs
+      INTEGER:: inu_c
+      real, dimension(15), parameter:: g_ratio = (/24,60,120,210,336,   &
+     &                504,720,990,1320,1716,2184,2730,3360,4080,4896/)
+
+      has_qc = .false.
+      has_qi = .false.
+      has_qs = .false.
+
+      do k = kts, kte
+         rho(k) = 0.622*p1d(k)/(R*t1d(k)*(qv1d(k)+0.622))
+         rc(k) = MAX(R1, qc1d(k)*rho(k))
+         nc(k) = MAX(R2, nc1d(k)*rho(k))
+         if (rc(k).gt.R1 .and. nc(k).gt.R2) has_qc = .true.
+         ri(k) = MAX(R1, qi1d(k)*rho(k))
+         ni(k) = MAX(R2, ni1d(k)*rho(k))
+         if (ri(k).gt.R1 .and. ni(k).gt.R2) has_qi = .true.
+         rs(k) = MAX(R1, qs1d(k)*rho(k))
+         if (rs(k).gt.R1) has_qs = .true.
+      enddo
+
+      if (has_qc) then
+      do k = kts, kte
+         if (rc(k).le.R1 .or. nc(k).le.R2) CYCLE
+         inu_c = MIN(15, NINT(1000.E6/nc(k)) + 2)
+         lamc = (nc(k)*am_r*g_ratio(inu_c)/rc(k))**obmr
+         re_qc1d(k) = MAX(2.51E-6, MIN(SNGL(0.5D0 * DBLE(3.+inu_c)/lamc), 50.E-6))
+      enddo
+      endif
+
+      if (has_qi) then
+      do k = kts, kte
+         if (ri(k).le.R1 .or. ni(k).le.R2) CYCLE
+         lami = (am_i*cig(2)*oig1*ni(k)/ri(k))**obmi
+         re_qi1d(k) = MAX(5.01E-6, MIN(SNGL(0.5D0 * DBLE(3.+mu_i)/lami), 125.E-6))
+      enddo
+      endif
+
+      if (has_qs) then
+      do k = kts, kte
+         if (rs(k).le.R1) CYCLE
+         tc0 = MIN(-0.1, t1d(k)-273.15)
+         smob = rs(k)*oams
+
+!..All other moments based on reference, 2nd moment.  If bm_s.ne.2,
+!.. then we must compute actual 2nd moment and use as reference.
+         if (bm_s.gt.(2.0-1.e-3) .and. bm_s.lt.(2.0+1.e-3)) then
+            smo2 = smob
+         else
+            loga_ = sa(1) + sa(2)*tc0 + sa(3)*bm_s &
+     &         + sa(4)*tc0*bm_s + sa(5)*tc0*tc0 &
+     &         + sa(6)*bm_s*bm_s + sa(7)*tc0*tc0*bm_s &
+     &         + sa(8)*tc0*bm_s*bm_s + sa(9)*tc0*tc0*tc0 &
+     &         + sa(10)*bm_s*bm_s*bm_s
+            a_ = 10.0**loga_
+            b_ = sb(1) + sb(2)*tc0 + sb(3)*bm_s &
+     &         + sb(4)*tc0*bm_s + sb(5)*tc0*tc0 &
+     &         + sb(6)*bm_s*bm_s + sb(7)*tc0*tc0*bm_s &
+     &         + sb(8)*tc0*bm_s*bm_s + sb(9)*tc0*tc0*tc0 &
+     &         + sb(10)*bm_s*bm_s*bm_s
+            smo2 = (smob/a_)**(1./b_)
+         endif
+!..Calculate bm_s+1 (th) moment.  Useful for diameter calcs.
+         loga_ = sa(1) + sa(2)*tc0 + sa(3)*cse(1) &
+     &         + sa(4)*tc0*cse(1) + sa(5)*tc0*tc0 &
+     &         + sa(6)*cse(1)*cse(1) + sa(7)*tc0*tc0*cse(1) &
+     &         + sa(8)*tc0*cse(1)*cse(1) + sa(9)*tc0*tc0*tc0 &
+     &         + sa(10)*cse(1)*cse(1)*cse(1)
+         a_ = 10.0**loga_
+         b_ = sb(1)+ sb(2)*tc0 + sb(3)*cse(1) + sb(4)*tc0*cse(1) &
+     &        + sb(5)*tc0*tc0 + sb(6)*cse(1)*cse(1) &
+     &        + sb(7)*tc0*tc0*cse(1) + sb(8)*tc0*cse(1)*cse(1) &
+     &        + sb(9)*tc0*tc0*tc0 + sb(10)*cse(1)*cse(1)*cse(1)
+         smoc = a_ * smo2**b_
+         re_qs1d(k) = MAX(25.E-6, MIN(0.5*smoc/smob, 999.E-6))
+      enddo
+      endif
+
+      end subroutine calc_effectRad
 
 !+---+-----------------------------------------------------------------+
 !..Compute radar reflectivity assuming 10 cm wavelength radar and using

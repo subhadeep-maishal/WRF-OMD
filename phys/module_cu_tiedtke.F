@@ -168,6 +168,8 @@ CONTAINS
 !-- P8w         3D hydrostatic pressure at full levels (Pa)
 !-- Pcps        3D hydrostatic pressure at half levels (Pa)
 !-- PI3D        3D exner function (dimensionless)
+!-- QVFTEN      3D water vapor advection tendency 
+!-- QVPBLTEN    3D water vapor tendency due to a PBL
 !-- RTHCUTEN      Theta tendency due to 
 !                 cumulus scheme precipitation (K/s)
 !-- RUCUTEN       U wind tendency due to 
@@ -190,6 +192,7 @@ CONTAINS
 !-- dz8w        dz between full levels (m)
 !-- QFX         upward moisture flux at the surface (kg/m^2/s)
 !-- DT          time step (s)
+!-- F_QV etc    flag values for tendencies, not used
 !-- ids         start index for i in domain
 !-- ide         end index for i in domain
 !-- jds         start index for j in domain
@@ -2040,7 +2043,7 @@ CONTAINS
 ! New scheme
 ! Let's define the fscale
         else if(orgen .eq. 2 ) then
-        tt(jl) = ptenh(jl,ikb)
+        tt(jl) = ptenh(jl,ikb-1)
         zqsat(jl) = TLUCUA(tt(jl))/paph(jl,ikb-1)
         zqsat(jl) = zqsat(jl)/(1.-VTMPC1*zqsat(jl))
         ttb(jl) = ptenh(jl,ikb)
