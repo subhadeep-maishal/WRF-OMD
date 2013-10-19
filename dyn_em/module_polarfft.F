@@ -1,3 +1,6 @@
+#ifdef MKL_DFTI
+include 'mkl_dfti.f90'
+#endif
 MODULE module_polarfft
 
   USE module_model_constants
@@ -5,6 +8,28 @@ MODULE module_polarfft
   CHARACTER (LEN=256) , PRIVATE :: a_message
 
 CONTAINS
+
+#ifdef VALIDATE_FILTER
+SUBROUTINE validation_mark(msg, u, nx, ny, fin)
+   IMPLICIT NONE
+   INTEGER nx, ny
+   REAL, DIMENSION(nx, ny) :: fin
+   INTEGER :: u
+   CHARACTER(*) :: msg
+
+   INTEGER i, j
+
+   DOUBLE PRECISION :: tmp
+
+   tmp = 0.0d0
+   DO j = 1, ny
+   DO i = 1, nx
+      tmp = tmp + dble(fin(i,j))
+   ENDDO
+   ENDDO
+   write(u, *) "VAL ", msg, " ", tmp / size(fin)
+END SUBROUTINE validation_mark
+#endif
 
 SUBROUTINE couple_scalars_for_filter ( field    &
                  ,mu,mub                        &
@@ -183,6 +208,9 @@ call wrf_get_myproc(myproc)
 !enddo
 !enddo
 
+#ifdef DEBUG_FILTER
+  write(0,*) "in pxft"
+#endif
 !!!!!!!!!!!!!!!!!!!!!!!
 ! U & V
    IF ( flag_uv .EQ. 1 ) THEN
@@ -463,6 +491,9 @@ SUBROUTINE polar_filter_3d( f, xlat, piggyback, fft_filter_lat, dvlat, &
                             its, ite, jts, jte, kts, kte,    &
                             positive_definite               )
 
+#ifdef DEBUG_FILTER
+  USE module_dm
+#endif
   IMPLICIT NONE
 
   INTEGER ,       INTENT(IN   ) :: ids, ide, jds, jde, kds, kde, &
@@ -483,17 +514,50 @@ SUBROUTINE polar_filter_3d( f, xlat, piggyback, fft_filter_lat, dvlat, &
   INTEGER :: k, nboxw, nbox2, istart, iend, overlap
   INTEGER, DIMENSION(6) :: wavenumber = (/ 1, 3, 7, 10, 13, 16 /)
 
+#ifdef DEBUG_FILTER
+  INTEGER, SAVE :: call_num = 0
+  INTEGER :: rank
+  CHARACTER*255 :: fname
+#endif
   ! Variables will stay in domain form since this routine is meaningless
   ! unless tile extent is the same as domain extent in E/W direction, i.e.,
   ! the processor has access to all grid points in E/W direction.
   ! There may be other ways of doing FFTs, but we haven't learned them yet...
 
+#ifdef DEBUG_FILTER
+  write(0,*) "in polar_filter_3d"
+#endif
   ! Check to make sure we have full access to all E/W points
   IF ((its /= ids) .OR. (ite /= ide)) THEN
      WRITE ( wrf_err_message , * ) 'module_polarfft: 3d: (its /= ids) or (ite /= ide)',its,ids,ite,ide
      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
   END IF
 
+#if defined(DEBUG_FILTER) && defined(DEBUG_FILTER_DUMP_DATA)
+  ! Dump input data into consecutive files
+  call wrf_get_myproc(rank)
+  lat = xlat(ids,jts) - dvlat
+  if (abs(lat) >= fft_filter_lat) then
+      write(fname, '("fftf_dump_",I4.4,"_",I4.4)') call_num, rank
+      write(0,*) "dumping input data for polar_filter_3d in", fname
+      open(45, file=fname, form='UNFORMATTED')
+      write(45) ids, ide, jds, jde, kds, kde
+      write(45) ims, ime, jms, jme, kms, kme
+      write(45) its, ite, jts, jte, kts, kte
+      write(45) f
+      write(45) xlat
+      write(45) piggyback
+      write(45) fft_filter_lat
+      write(45) dvlat
+      if (present(positive_definite)) then
+          write(45) positive_definite
+      else
+          write(45) .FALSE.
+      endif
+      close(45)
+   endif
+  call_num = call_num + 1
+#endif
 
   nx = ide-ids ! "U" stagger variables will be repeated by periodic BCs
   ny = kte-kts+1 ! we can filter extra level for variables that are non-Z-staggered
@@ -537,6 +601,9 @@ END SUBROUTINE polar_filter_3d
 !------------------------------------------------------------------------------
 
 SUBROUTINE polar_filter_fft_2d_ncar(nx,ny,fin,lat,filter_latitude,piggyback)
+#ifdef MKL_DFTI
+  USE mkl_dfti
+#endif
   IMPLICIT NONE
   INTEGER , INTENT(IN) :: nx, ny
   REAL , DIMENSION(nx,ny), INTENT(INOUT) :: fin
@@ -556,6 +623,16 @@ SUBROUTINE polar_filter_fft_2d_ncar(nx,ny,fin,lat,filter_latitude,piggyback)
 
   INTEGER :: ntop
 
+#ifdef BENCHMARK_FILTER
+  INTEGER :: timer
+#endif
+#ifdef MKL_DFTI
+  TYPE(DFTI_DESCRIPTOR), POINTER :: handle
+  INTEGER :: k
+#endif
+#ifdef BENCHMARK_FILTER
+  timer = RSL_INTERNAL_MILLICLOCK()
+#endif
   pi = ACOS(-1.)
   rcosref = 1./COS(filter_latitude*pi/180.)
 
@@ -575,6 +652,27 @@ SUBROUTINE polar_filter_fft_2d_ncar(nx,ny,fin,lat,filter_latitude,piggyback)
 !  initialize coefficients, place in wsave 
 !   (should place this in init and save wsave at program start)
 
+#ifdef VALIDATE_FILTER
+  call validation_mark("input", 0, nx, ny, fin)
+#endif
+#ifdef MKL_DFTI
+  ier = DftiCreateDescriptor(handle, DFTI_SINGLE, DFTI_REAL, 1, n)
+  ier = DftiSetValue(handle, DFTI_NUMBER_OF_TRANSFORMS, lot)
+  ier = DftiSetValue(handle, DFTI_INPUT_DISTANCE, jump)
+  ier = DFtiSetValue(handle, DFTI_OUTPUT_DISTANCE, jump)
+  ier = DftiSetValue(handle, DFTI_PLACEMENT, DFTI_INPLACE)
+  ier = DftiSetValue(handle, DFTI_PACKED_FORMAT, DFTI_PACK_FORMAT)
+  ier = DftiSetValue(handle, DFTI_FORWARD_SCALE, 1/real(n))
+  ier = DftiCommitDescriptor(handle)
+  ier = DftiComputeForward(handle, fin(:,1))
+  ! extra bonfire dance to make this work the way fftpack5 works:
+  ! * scale all but the first (and the last if n is even)
+  !   elements by 2
+  ! // inc is known to be 1
+  k = n - mod(n + 1, 2)
+  fin(3:k:2,1:lot) = fin(3:k:2,1:lot) * -2.0
+  fin(2:k:2,1:lot) = fin(2:k:2,1:lot) * 2.0
+#else
   call rfftmi(n,wsave,lensav,ier)
   IF(ier /= 0) THEN
     write(a_message,*) ' error in rfftmi ',ier
@@ -588,6 +686,10 @@ SUBROUTINE polar_filter_fft_2d_ncar(nx,ny,fin,lat,filter_latitude,piggyback)
     write(a_message,*) ' error in rfftmf ',ier
     CALL wrf_message ( a_message ) 
   END IF
+#endif
+#ifdef VALIDATE_FILTER
+  call validation_mark("post-forward", 0, nx, ny, fin)
+#endif
 
   if(MOD(n,2) == 0) then
     nh = n/2 - 1
@@ -638,13 +740,39 @@ SUBROUTINE polar_filter_fft_2d_ncar(nx,ny,fin,lat,filter_latitude,piggyback)
     ENDDO
   ENDDO
 
+#ifdef VALIDATE_FILTER
+  call validation_mark("post-filter", 0, nx, ny, fin)
+#endif
+
 !  do the backward transform
+
+#ifdef MKL_DFTI
+  ! extra bonfire dance to make this work the way fftpack5 works:
+  ! * scale all but the first (and the last if n is even)
+  !   elements by 1/2 for real parts and by -1/2 for imaginary
+  !   parts
+  ! // inc is known to be 1
+  k = n - mod(n + 1, 2)
+  fin(3:k:2,1:lot) = fin(3:k:2,1:lot) * -0.5
+  fin(2:k:2,1:lot) = fin(2:k:2,1:lot) * 0.5
+  ier = DftiComputeBackward(handle, fin(:,1))
+  ier = DftiFreeDescriptor(handle)
+#else
 
   call rfftmb( lot, jump, n, inc, fin, lenr, wsave, lensav, work, lenwrk, ier )
   IF(ier /= 0) THEN
     write(a_message,*) ' error in rfftmb ',ier
     CALL wrf_message ( a_message ) 
   END IF
+
+#endif
+#ifdef BENCHMARK_FILTER
+  timer = RSL_INTERNAL_MILLICLOCK() - timer
+  write(0, *) "polar_filter_fft_2d_ncar took", timer, "musecs"
+#endif
+#ifdef VALIDATE_FILTER
+  call validation_mark("post-backward", 0, nx, ny, fin)
+#endif
 
 END SUBROUTINE polar_filter_fft_2d_ncar
 
